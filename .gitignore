@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+.env
+firebase-credentials.json
+bot.log
+*.egg-info/
+.DS_Store
