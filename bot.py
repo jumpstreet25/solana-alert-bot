@@ -88,6 +88,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 import warnings
@@ -109,6 +110,7 @@ if not hasattr(asyncio, "to_thread"):
         return await loop.run_in_executor(_executor, functools.partial(fn, *args, **kwargs))
     asyncio.to_thread = _to_thread  # type: ignore
 
+import re
 import requests
 import pandas as pd
 from dotenv import load_dotenv
@@ -246,9 +248,19 @@ class TAResult:
     score:             int   = 0
     reasons:           List[str] = field(default_factory=list)
 
+    # Bearish signals (negative scoring)
+    bearish_score:     int   = 0
+    bearish_reasons:   List[str] = field(default_factory=list)
+    sell_pct:          Optional[int] = None   # 25 / 50 / 75 recommendation
+
     @property
     def is_bullish(self) -> bool:
         return self.score >= CFG.min_score
+
+    @property
+    def is_bearish(self) -> bool:
+        """Bearish confluence fires when bearish_score <= -3."""
+        return self.bearish_score <= -3
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -536,6 +548,14 @@ class TAEngine:
         self._check_ema_cross(result, df_15m, tf_label)
         self._check_volume(result, df_15m, tf_label)
 
+        # ── Step 4: bearish signals ───────────────────────────────────────────
+        self._check_bear_ema200(result, df_1h)
+        self._check_bear_macd(result, df_15m, tf_label)
+        self._check_bear_rsi(result, df_15m, tf_label)
+        self._check_bear_ema_cross(result, df_15m, tf_label)
+        self._check_bear_volume_down(result, df_15m, tf_label)
+        self._compute_sell_pct(result)
+
         return result
 
     # ── Indicator computation (ta library + plain pandas EWM) ─────────────────
@@ -678,6 +698,120 @@ class TAEngine:
                 f"Volume surge {ratio:.1f}× above {CFG.vol_avg_period}-candle avg on {tf}"
             )
 
+    # ── Bearish signal checkers ───────────────────────────────────────────────
+    # Mirror of bullish checkers — each subtracts from bearish_score.
+    #
+    # Scoring:
+    #   -2  1h   Price < EMA(200)                 macro downtrend confirmed
+    #   -2  15m  MACD death cross                 momentum turning bearish
+    #   -1  15m  RSI drops below 50 or < 40       weakening momentum
+    #   -1  15m  EMA(9) crosses below EMA(21)     short-term trend reversal
+    #   -1  15m  Volume surge on a down candle    sellers stepping in
+    #   ───
+    #   -7  min  (bearish alert fires at score <= -3)
+
+    def _check_bear_ema200(self, result: TAResult, df: Optional[pd.DataFrame]) -> None:
+        if df is None or len(df) < CFG.ema200_period:
+            return
+        ema200     = self._ema(df["close"], CFG.ema200_period).iloc[-1]
+        last_close = df["close"].iloc[-1]
+        if pd.isna(ema200):
+            return
+        if last_close < ema200:
+            result.bearish_score -= 2
+            pct = (1 - last_close / ema200) * 100
+            result.bearish_reasons.append(
+                f"Price {pct:.1f}% below EMA200 on 1h (macro downtrend)"
+            )
+
+    def _check_bear_macd(self, result: TAResult, df: pd.DataFrame, tf: str = "15m") -> None:
+        curr_macd, prev_macd = df["macd"].iloc[-1],     df["macd"].iloc[-2]
+        curr_sig,  prev_sig  = df["macd_sig"].iloc[-1], df["macd_sig"].iloc[-2]
+        curr_hist, prev_hist = df["macd_hist"].iloc[-1], df["macd_hist"].iloc[-2]
+        if any(pd.isna(v) for v in [curr_macd, prev_macd, curr_sig, prev_sig]):
+            return
+        death_cross      = curr_macd < curr_sig and prev_macd >= prev_sig
+        hist_contracting = (
+            pd.notna(curr_hist) and pd.notna(prev_hist)
+            and curr_hist < 0 and curr_hist < prev_hist
+            and curr_macd < curr_sig
+        )
+        if death_cross or hist_contracting:
+            result.bearish_score -= 2
+            kind = "death cross" if death_cross else "bearish momentum"
+            result.bearish_reasons.append(
+                f"MACD {kind} on {tf} (hist: {float(curr_hist):+.6f})"
+            )
+
+    def _check_bear_rsi(self, result: TAResult, df: pd.DataFrame, tf: str = "15m") -> None:
+        curr = df["rsi"].iloc[-1]
+        prev = df["rsi"].iloc[-2]
+        if pd.isna(curr) or pd.isna(prev):
+            return
+        # Ensure rsi_value is populated (may already be set by bullish check)
+        if result.rsi_value == 0.0:
+            result.rsi_value = float(curr)
+        cross_below_50 = prev > 50 >= curr
+        below_40       = curr < 40 and curr < prev
+        if cross_below_50:
+            result.bearish_score -= 1
+            result.bearish_reasons.append(
+                f"RSI crossed below 50 ({prev:.1f} → {curr:.1f}) on {tf}"
+            )
+        elif below_40:
+            result.bearish_score -= 1
+            result.bearish_reasons.append(f"RSI below 40 and falling ({curr:.1f}) on {tf}")
+
+    def _check_bear_ema_cross(self, result: TAResult, df: pd.DataFrame, tf: str = "15m") -> None:
+        cf, pf = df["ema_fast"].iloc[-1], df["ema_fast"].iloc[-2]
+        cs, ps = df["ema_slow"].iloc[-1], df["ema_slow"].iloc[-2]
+        if any(pd.isna(v) for v in [cf, pf, cs, ps]):
+            return
+        death_cross  = cf < cs and pf >= ps
+        gap_widening = cf < cs and (cs - cf) > (ps - pf)
+        if death_cross or gap_widening:
+            result.bearish_score -= 1
+            kind = "death cross" if death_cross else "widening bearish gap"
+            result.bearish_reasons.append(
+                f"EMA{CFG.ema_fast} {kind} below EMA{CFG.ema_slow} on {tf}"
+            )
+
+    def _check_bear_volume_down(self, result: TAResult, df: pd.DataFrame, tf: str = "15m") -> None:
+        """Volume surge on a down candle = institutional selling."""
+        if len(df) <= CFG.vol_avg_period:
+            return
+        avg       = df["volume"].iloc[-(CFG.vol_avg_period + 1):-1].mean()
+        curr_vol  = df["volume"].iloc[-1]
+        curr_open = df["open"].iloc[-1]
+        curr_cls  = df["close"].iloc[-1]
+        if pd.isna(avg) or avg <= 0 or pd.isna(curr_vol):
+            return
+        is_red_candle = curr_cls < curr_open
+        ratio         = curr_vol / avg
+        if is_red_candle and ratio >= CFG.vol_multiplier:
+            result.bearish_score -= 1
+            result.bearish_reasons.append(
+                f"Volume surge {ratio:.1f}× on a down candle on {tf} (selling pressure)"
+            )
+
+    def _compute_sell_pct(self, result: TAResult) -> None:
+        """
+        Recommend what % of a position to sell based on RSI overbought + bearish score.
+        Only fires when there are at least some bearish signals.
+        """
+        if result.bearish_score >= 0:
+            return
+        rsi = result.rsi_value
+        bs  = result.bearish_score
+        if rsi > 75 and bs <= -4:
+            result.sell_pct = 75
+        elif rsi > 75 and bs <= -3:
+            result.sell_pct = 50
+        elif rsi > 65 and bs <= -2:
+            result.sell_pct = 25
+        elif bs <= -5:
+            result.sell_pct = 50
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ALERT SENDER
@@ -732,6 +866,33 @@ class AlertSender:
             *[f"• {reason}" for reason in r.reasons],
         ])
         return title, body
+
+    def _xmtp_message(self, r: TAResult) -> str:
+        """Format a bullish alert as a single string for the OnlyMonkes chat."""
+        lines = [
+            f"🚀 {r.token.symbol} Bullish Signal  [{r.score}/7]",
+            f"Price: {self._fmt_price(r.price)}  ({r.price_change_1h:+.1f}% 1h / {r.price_change_5m:+.1f}% 5m)",
+            f"RSI: {r.rsi_value:.1f}  |  Vol 24h: ${r.volume_24h:,.0f}  |  Liq: ${r.liquidity_usd:,.0f}",
+            f"CA: {r.token.mint}",
+            "",
+            *[f"• {reason}" for reason in r.reasons],
+        ]
+        return "\n".join(lines)
+
+    def _xmtp_bearish_message(self, r: TAResult) -> str:
+        """Format a bearish alert for the OnlyMonkes chat."""
+        sell_note = f"\n⚠️ Consider selling {r.sell_pct}% of your {r.token.symbol} position." if r.sell_pct else ""
+        lines = [
+            f"⚠️ {r.token.symbol} Bearish Signal  [{r.bearish_score}]",
+            f"Price: {self._fmt_price(r.price)}  ({r.price_change_1h:+.1f}% 1h / {r.price_change_5m:+.1f}% 5m)",
+            f"RSI: {r.rsi_value:.1f}  |  Vol 24h: ${r.volume_24h:,.0f}  |  Liq: ${r.liquidity_usd:,.0f}",
+            f"CA: {r.token.mint}",
+            "",
+            *[f"• {reason}" for reason in r.bearish_reasons],
+        ]
+        if sell_note:
+            lines.append(sell_note)
+        return "\n".join(lines)
 
     # ── Console ────────────────────────────────────────────────────────────────
 
@@ -798,17 +959,159 @@ class AlertSender:
         except Exception as exc:
             log.error("Telegram send failed for %s: %s", r.token.symbol, exc)
 
+    # ── XMTP via HTTP (xmtp_agent.js server on :3001) ─────────────────────────
+
+    def _post_to_agent(self, message: str, alert_type: str = "alert") -> bool:
+        """
+        POST an alert to the xmtp_agent HTTP server.
+        Returns True on success.  Falls back to console-only on failure.
+        """
+        import urllib.request as _urllib_req
+        url  = "http://127.0.0.1:3001/alert"
+        data = json.dumps({"message": message, "type": alert_type}).encode()
+        try:
+            req = _urllib_req.Request(
+                url, data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _urllib_req.urlopen(req, timeout=10):
+                pass
+            return True
+        except Exception as exc:
+            log.error("Failed to POST alert to xmtp_agent (%s): %s", url, exc)
+            return False
+
+    def xmtp(self, r: TAResult) -> None:
+        """Send a bullish alert to the OnlyMonkes XMTP group via xmtp_agent."""
+        message = self._xmtp_message(r)
+        if not self._post_to_agent(message, "bullish"):
+            log.warning("XMTP bullish alert could not be delivered for %s", r.token.symbol)
+        else:
+            log.info("XMTP bullish alert delivered: %s", r.token.symbol)
+
+    def xmtp_bearish(self, r: TAResult) -> None:
+        """Send a bearish alert to the OnlyMonkes XMTP group via xmtp_agent."""
+        message = self._xmtp_bearish_message(r)
+        if not self._post_to_agent(message, "bearish"):
+            log.warning("XMTP bearish alert could not be delivered for %s", r.token.symbol)
+        else:
+            log.info("XMTP bearish alert delivered: %s", r.token.symbol)
+
+    # ── XMTP NFT sale alert ────────────────────────────────────────────────────
+
+    def xmtp_nft_sale(self, sale: dict, name: str) -> None:
+        """Send a Saga Monkes sale alert to the OnlyMonkes XMTP group."""
+        buyer  = sale.get("buyer",  "")
+        seller = sale.get("seller", "")
+        price  = sale.get("price",  0.0)
+        buyer_short  = f"{buyer[:4]}…{buyer[-4:]}"  if len(buyer)  > 8 else buyer
+        seller_short = f"{seller[:4]}…{seller[-4:]}" if len(seller) > 8 else seller
+        message = "\n".join([
+            f"🐒 {name} just sold for {price:.4f} SOL",
+            f"Buyer:  {buyer_short}",
+            f"Seller: {seller_short}",
+        ])
+        if not self._post_to_agent(message, "nft_sale"):
+            log.warning("XMTP NFT sale alert could not be delivered for %s", name)
+        else:
+            log.info("XMTP NFT sale alert delivered: %s", name)
+
     # ── Dispatch ───────────────────────────────────────────────────────────────
 
     def send_all(self, r: TAResult) -> None:
+        """Dispatch a bullish alert via all channels."""
         self.console(r)
         self.fcm(r)
         self.telegram(r)
+        self.xmtp(r)
+
+    def send_all_bearish(self, r: TAResult) -> None:
+        """Dispatch a bearish alert via console + XMTP."""
+        sep = "═" * 62
+        print(f"\n{sep}")
+        print(f"  ⚠️  {r.token.symbol} Bearish Signal  [{r.bearish_score}]")
+        print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(sep)
+        price_line = (
+            f"  Price: {self._fmt_price(r.price)}"
+            f"  ({r.price_change_1h:+.1f}% 1h / {r.price_change_5m:+.1f}% 5m)"
+        )
+        print(price_line)
+        print(f"  RSI: {r.rsi_value:.1f}")
+        for reason in r.bearish_reasons:
+            print(f"  • {reason}")
+        if r.sell_pct:
+            print(f"  ⚠️ Sell recommendation: {r.sell_pct}% of position")
+        print(f"{sep}\n")
+        self.xmtp_bearish(r)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TOKEN STORE  —  simple JSON persistence
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Saga Monkes NFT Sales Monitor
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SagaMonkesSalesMonitor:
+    """Polls Magic Eden for new Saga Monkes buyNow sales and fires XMTP alerts."""
+
+    _ME_URL = (
+        "https://api-mainnet.magiceden.dev/v2/collections/sagamonkes/activities"
+        "?offset=0&limit=20&type=buyNow"
+    )
+
+    def __init__(self, alerts: AlertSender):
+        self._alerts      = alerts
+        self._seen: set   = set()
+        self._initialized = False
+
+    @staticmethod
+    def _nft_name(sale: dict) -> str:
+        """Derive 'MONKE #NNNN' from image URL, e.g. '.../7114.png'."""
+        m = re.search(r"/(\d+)\.png$", sale.get("image", ""))
+        return f"MONKE #{m.group(1)}" if m else "Saga Monke"
+
+    def check(self) -> None:
+        try:
+            resp = requests.get(
+                self._ME_URL,
+                timeout=10,
+                headers={"User-Agent": "OnlyMonkes-Bot/1.0"},
+            )
+            resp.raise_for_status()
+            sales: List[dict] = resp.json()
+        except Exception as exc:
+            log.warning("SagaMonkes sales fetch failed: %s", exc)
+            return
+
+        if not sales:
+            return
+
+        # First run: seed seen set without alerting
+        if not self._initialized:
+            for sale in sales:
+                self._seen.add(sale["signature"])
+            self._initialized = True
+            log.info("SagaMonkes sales monitor active — watching for new sales")
+            return
+
+        new_sales = [s for s in sales if s["signature"] not in self._seen]
+        for sale in reversed(new_sales):  # oldest first
+            self._seen.add(sale["signature"])
+            name = self._nft_name(sale)
+            log.info(
+                "🐒 New Saga Monkes sale: %s  %.4f SOL  buyer %s…",
+                name, sale.get("price", 0), sale.get("buyer", "?")[:8],
+            )
+            self._alerts.xmtp_nft_sale(sale, name)
+
+        # Keep seen set bounded
+        if len(self._seen) > 500:
+            self._seen = set(list(self._seen)[-200:])
+
 
 class TokenStore:
     """Loads and saves the watched-token list from a local JSON file."""
@@ -856,11 +1159,16 @@ class SolanaAlertBot:
     """
 
     def __init__(self):
-        self._store  = TokenStore()
-        self._dex    = DexScreener()
-        self._ta     = TAEngine()
-        self._alerts = AlertSender()
+        self._store       = TokenStore()
+        self._dex         = DexScreener()
+        self._ta          = TAEngine()
+        self._alerts      = AlertSender()
         self._tokens: List[TokenInfo] = []
+        self._nft_monitor = SagaMonkesSalesMonitor(self._alerts)
+        # Separate cooldown tracking for bearish alerts (keyed by mint)
+        self._last_bearish_alert: Dict[str, float] = {}
+        # Latest TA results for bot_state.json (keyed by mint)
+        self._latest_results: Dict[str, TAResult] = {}
 
     # ── Pool discovery ─────────────────────────────────────────────────────────
 
@@ -887,7 +1195,7 @@ class SolanaAlertBot:
     # ── Alert gate ─────────────────────────────────────────────────────────────
 
     def _cooldown_ok(self, result: TAResult) -> bool:
-        """Return True if enough time has passed since the last alert for this token."""
+        """Return True if enough time has passed since the last bullish alert."""
         cooldown = CFG.alert_cooldown * 60
         elapsed  = time.time() - result.token.last_alert_time
         if elapsed < cooldown:
@@ -897,6 +1205,54 @@ class SolanaAlertBot:
             )
             return False
         return True
+
+    def _bearish_cooldown_ok(self, mint: str) -> bool:
+        """Return True if enough time has passed since the last bearish alert."""
+        cooldown = CFG.alert_cooldown * 60
+        last     = self._last_bearish_alert.get(mint, 0.0)
+        elapsed  = time.time() - last
+        if elapsed < cooldown:
+            return False
+        return True
+
+    # ── Bot state writer ───────────────────────────────────────────────────────
+
+    def _write_bot_state(self) -> None:
+        """
+        Serialise the latest TA results to bot_state.json so xmtp_agent.js
+        can provide Claude with live market context when answering DMs.
+        """
+        tokens_data = []
+        for result in self._latest_results.values():
+            tokens_data.append({
+                "symbol":          result.token.symbol,
+                "name":            result.token.name,
+                "mint":            result.token.mint,
+                "price":           result.price,
+                "price_change_1h": result.price_change_1h,
+                "price_change_5m": result.price_change_5m,
+                "volume_24h":      result.volume_24h,
+                "liquidity_usd":   result.liquidity_usd,
+                "rsi":             result.rsi_value,
+                "macd_histogram":  result.macd_histogram,
+                "score":           result.score,
+                "bearish_score":   result.bearish_score,
+                "is_bullish":      result.is_bullish,
+                "is_bearish":      result.is_bearish,
+                "sell_pct":        result.sell_pct,
+                "reasons":         result.reasons,
+                "bearish_reasons": result.bearish_reasons,
+            })
+        state = {
+            "last_updated": datetime.utcnow().isoformat() + "Z",
+            "tokens":       tokens_data,
+        }
+        try:
+            bot_state_path = os.path.join(os.path.dirname(__file__), "bot_state.json")
+            with open(bot_state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+        except Exception as exc:
+            log.warning("Failed to write bot_state.json: %s", exc)
 
     # ── Single-token check ─────────────────────────────────────────────────────
 
@@ -917,20 +1273,34 @@ class SolanaAlertBot:
         if result is None:
             return
 
-        fire = result.is_bullish and self._cooldown_ok(result)
+        # Store latest result for bot_state.json
+        self._latest_results[token.mint] = result
+
+        fire_bullish = result.is_bullish and self._cooldown_ok(result)
+        fire_bearish = result.is_bearish and self._bearish_cooldown_ok(token.mint)
+
         log.info(
-            "  %-10s score=%d/7  RSI=%4.1f  price=%s  %s",
+            "  %-10s  bull=%d/7  bear=%d  RSI=%4.1f  price=%s  sell=%s  %s",
             result.token.symbol,
             result.score,
+            result.bearish_score,
             result.rsi_value,
             AlertSender._fmt_price(result.price),
-            "✓ ALERT FIRED" if fire else "",
+            f"{result.sell_pct}%" if result.sell_pct else "—",
+            " ".join(filter(None, [
+                "🚀 BULLISH" if fire_bullish else "",
+                "⚠️ BEARISH" if fire_bearish else "",
+            ])),
         )
 
-        if fire:
+        if fire_bullish:
             self._alerts.send_all(result)
             token.last_alert_time = time.time()
             self._store.save(self._tokens)
+
+        if fire_bearish:
+            self._alerts.send_all_bearish(result)
+            self._last_bearish_alert[token.mint] = time.time()
 
     # ── Main async loop ────────────────────────────────────────────────────────
 
@@ -956,9 +1326,24 @@ class SolanaAlertBot:
                     log.error("Unexpected error for %s: %s", token.mint[:8], exc, exc_info=True)
 
             elapsed  = time.monotonic() - cycle_start
+            # Write latest TA data for xmtp_agent.js / Claude context
+            self._write_bot_state()
             sleep_for = max(0.0, CFG.poll_interval - elapsed)
             log.info("── Cycle done in %.1fs — next in %.0fs ─────", elapsed, sleep_for)
             await asyncio.sleep(sleep_for)
+
+    # ── NFT sales loop ─────────────────────────────────────────────────────────
+
+    async def _nft_monitor_loop(self) -> None:
+        """Poll for Saga Monkes sales every 30 seconds."""
+        while True:
+            try:
+                await asyncio.to_thread(self._nft_monitor.check)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error("NFT sales monitor error: %s", exc)
+            await asyncio.sleep(30)
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -975,8 +1360,12 @@ class SolanaAlertBot:
                 "\n⚠️  No tokens in watch list!\n"
                 "  Add one with:  python bot.py add <MINT_ADDRESS>\n"
             )
+
+        async def _run_all():
+            await asyncio.gather(self._loop(), self._nft_monitor_loop())
+
         try:
-            asyncio.run(self._loop())
+            asyncio.run(_run_all())
         except KeyboardInterrupt:
             log.info("Stopped by user (Ctrl+C)")
             print("\n👋 Bot stopped.")

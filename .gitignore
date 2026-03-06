@@ -6,3 +6,18 @@ firebase-credentials.json
 bot.log
 *.egg-info/
 .DS_Store
+
+# Node
+node_modules/
+package-lock.json
+
+# XMTP runtime / secrets
+.xmtp_bot_key
+.xmtp_bot*.db3
+.xmtp_bot*.db3-shm
+.xmtp_bot*.db3-wal
+.xmtp_bot*.sqlcipher_salt
+.xmtp_welcomed.json
+
+# Bot runtime state
+bot_state.json

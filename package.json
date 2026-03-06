@@ -1,0 +1,28 @@
+{
+  "name": "solana-alert-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jumpstreet25/solana-alert-bot.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/jumpstreet25/solana-alert-bot/issues"
+  },
+  "homepage": "https://github.com/jumpstreet25/solana-alert-bot#readme",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "@xmtp/node-sdk": "^5.4.0",
+    "dotenv": "^17.3.1",
+    "ethers": "^6.16.0",
+    "express": "^4.21.2"
+  }
+}
