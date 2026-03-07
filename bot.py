@@ -1024,7 +1024,6 @@ class AlertSender:
         self.console(r)
         self.fcm(r)
         self.telegram(r)
-        self.xmtp(r)
 
     def send_all_bearish(self, r: TAResult) -> None:
         """Dispatch a bearish alert via console + XMTP."""
@@ -1044,7 +1043,6 @@ class AlertSender:
         if r.sell_pct:
             print(f"  ⚠️ Sell recommendation: {r.sell_pct}% of position")
         print(f"{sep}\n")
-        self.xmtp_bearish(r)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
