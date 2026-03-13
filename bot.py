@@ -121,13 +121,6 @@ import ta as ta_lib
 # ── Load .env file ────────────────────────────────────────────────────────────
 load_dotenv()
 
-# ── Optional: Firebase Admin SDK ──────────────────────────────────────────────
-try:
-    import firebase_admin
-    from firebase_admin import credentials as fb_credentials, messaging
-    _FCM_AVAILABLE = True
-except ImportError:
-    _FCM_AVAILABLE = False
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -182,11 +175,6 @@ class Config:
     request_timeout: int  = 15
     max_retries: int      = 3
     retry_base_delay: float = 2.0
-
-    # ── Firebase ──────────────────────────────────────────────────────────────
-    fcm_creds_file:   str = os.getenv("FCM_CREDENTIALS_FILE", "firebase-credentials.json")
-    fcm_topic:        str = os.getenv("FCM_TOPIC", "solana_alerts")
-    fcm_device_token: str = os.getenv("FCM_DEVICE_TOKEN", "")
 
     # ── Telegram ──────────────────────────────────────────────────────────────
     telegram_token:   str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -398,6 +386,55 @@ class DexScreener:
             }
         except (KeyError, ValueError, TypeError) as exc:
             log.error("DexScreener parse error for %s: %s", mint[:8], exc)
+            return None
+
+    def trending_solana(self, top_n: int = 30) -> List[str]:
+        """Return up to top_n Solana token mints from DexScreener trending boosts."""
+        data = _get("https://api.dexscreener.com/token-boosts/top/v1", limiter=_dex_rl)
+        if not data or not isinstance(data, list):
+            return []
+        mints: List[str] = []
+        for item in data:
+            if item.get("chainId") == "solana" and item.get("tokenAddress"):
+                mints.append(item["tokenAddress"])
+                if len(mints) >= top_n:
+                    break
+        return mints
+
+    def search(self, query: str) -> Optional[dict]:
+        """Search DexScreener for a token by symbol or mint. Returns best Solana pair data."""
+        data = _get(
+            f"{CFG.dex_base}/search",
+            params={"q": query},
+            limiter=_dex_rl,
+        )
+        if not data:
+            return None
+        pairs = [
+            p for p in (data.get("pairs") or [])
+            if p.get("chainId") == "solana"
+        ]
+        if not pairs:
+            return None
+        pairs.sort(
+            key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
+            reverse=True,
+        )
+        p = pairs[0]
+        try:
+            pc = p.get("priceChange") or {}
+            vol = p.get("volume") or {}
+            liq = p.get("liquidity") or {}
+            return {
+                "symbol":          p.get("baseToken", {}).get("symbol", query),
+                "name":            p.get("baseToken", {}).get("name", ""),
+                "price":           float(p.get("priceUsd") or 0),
+                "price_change_1h": float(pc.get("h1") or 0),
+                "price_change_24h": float(pc.get("h24") or 0),
+                "volume_24h":      float(vol.get("h24") or 0),
+                "liquidity_usd":   float(liq.get("usd") or 0),
+            }
+        except (KeyError, ValueError, TypeError):
             return None
 
 
@@ -818,30 +855,10 @@ class TAEngine:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class AlertSender:
-    """Dispatches alerts via console, FCM push, and/or Telegram."""
+    """Dispatches alerts via console, Telegram, and XMTP (via Monke_Eliza HTTP)."""
 
     def __init__(self):
-        self._fcm_ready = False
-        self._init_fcm()
-
-    def _init_fcm(self) -> None:
-        if not _FCM_AVAILABLE:
-            log.info("firebase-admin not installed — FCM disabled")
-            return
-        if not Path(CFG.fcm_creds_file).exists():
-            log.warning(
-                "FCM credentials not found at '%s' — FCM disabled. "
-                "Download from Firebase Console → Project Settings → Service Accounts.",
-                CFG.fcm_creds_file,
-            )
-            return
-        try:
-            cred = fb_credentials.Certificate(CFG.fcm_creds_file)
-            firebase_admin.initialize_app(cred)
-            self._fcm_ready = True
-            log.info("Firebase Admin SDK initialised — FCM ready")
-        except Exception as exc:
-            log.error("Firebase init failed: %s", exc)
+        pass
 
     # ── Formatting helpers ─────────────────────────────────────────────────────
 
@@ -867,31 +884,74 @@ class AlertSender:
         ])
         return title, body
 
+    def _risk_dot(self, score: int, is_bullish: bool = True) -> str:
+        """🟢 Low Risk, 🟡 Medium, 🔴 High Risk."""
+        if is_bullish:
+            return "🟢" if score >= 5 else ("🟡" if score >= 3 else "🔴")
+        else:
+            return "🔴" if abs(score) >= 4 else ("🟡" if abs(score) >= 3 else "🟢")
+
+    def _confluence_tags(self, r: TAResult) -> str:
+        """Build compact confluence tag string from reasons."""
+        tags = []
+        for reason in r.reasons:
+            low = reason.lower()
+            if "rsi" in low:
+                tags.append("RSI")
+            elif "macd" in low and "cross" in low:
+                tags.append("MACD Cross")
+            elif "macd" in low:
+                tags.append("MACD")
+            elif "bollinger" in low or "bb" in low or "squeeze" in low:
+                tags.append("BB Squeeze")
+            elif "ema" in low and "cross" in low:
+                tags.append("EMA Cross")
+            elif "volume" in low:
+                tags.append("Vol Spike")
+        return " + ".join(tags) if tags else " + ".join(r.reasons[:3])
+
     def _xmtp_message(self, r: TAResult) -> str:
-        """Format a bullish alert as a single string for the OnlyMonkes chat."""
+        """Format a bullish alert — short, punchy, witty."""
+        risk = self._risk_dot(r.score, is_bullish=True)
+        confluence = self._confluence_tags(r)
+        change_str = f"{r.price_change_1h:+.1f}% 1h"
         lines = [
-            f"🚀 {r.token.symbol} Bullish Signal  [{r.score}/7]",
-            f"Price: {self._fmt_price(r.price)}  ({r.price_change_1h:+.1f}% 1h / {r.price_change_5m:+.1f}% 5m)",
-            f"RSI: {r.rsi_value:.1f}  |  Vol 24h: ${r.volume_24h:,.0f}  |  Liq: ${r.liquidity_usd:,.0f}",
-            f"CA: {r.token.mint}",
-            "",
-            *[f"• {reason}" for reason in r.reasons],
+            f"{risk} ${r.token.symbol} {change_str} — Score: {r.score}/7",
+            f"Confluence: {confluence}",
+            f"",
+            f"{self._fmt_price(r.price)} | Vol ${r.volume_24h:,.0f} | Liq ${r.liquidity_usd:,.0f}",
+            f"",
+            f"📊 https://dexscreener.com/solana/{r.token.mint}",
+            f"⚡ https://jup.ag/swap/SOL-{r.token.symbol}",
+            f"DYOR — Monkes manage risk 🐒",
         ]
         return "\n".join(lines)
 
     def _xmtp_bearish_message(self, r: TAResult) -> str:
-        """Format a bearish alert for the OnlyMonkes chat."""
-        sell_note = f"\n⚠️ Consider selling {r.sell_pct}% of your {r.token.symbol} position." if r.sell_pct else ""
+        """Format a bearish alert — concise warning."""
+        risk = self._risk_dot(r.bearish_score, is_bullish=False)
+        sell_note = f"Consider selling {r.sell_pct}%" if r.sell_pct else ""
+        tags = []
+        for reason in r.bearish_reasons:
+            low = reason.lower()
+            if "ema" in low: tags.append("EMA Death Cross")
+            elif "macd" in low: tags.append("MACD Bearish")
+            elif "rsi" in low: tags.append("RSI Weak")
+            elif "volume" in low: tags.append("Vol on Red")
+        confluence = " + ".join(tags) if tags else " + ".join(r.bearish_reasons[:3])
         lines = [
-            f"⚠️ {r.token.symbol} Bearish Signal  [{r.bearish_score}]",
-            f"Price: {self._fmt_price(r.price)}  ({r.price_change_1h:+.1f}% 1h / {r.price_change_5m:+.1f}% 5m)",
-            f"RSI: {r.rsi_value:.1f}  |  Vol 24h: ${r.volume_24h:,.0f}  |  Liq: ${r.liquidity_usd:,.0f}",
-            f"CA: {r.token.mint}",
-            "",
-            *[f"• {reason}" for reason in r.bearish_reasons],
+            f"{risk} ${r.token.symbol} BEARISH — Score: {r.bearish_score}",
+            f"Confluence: {confluence}",
+            f"",
+            f"{self._fmt_price(r.price)} ({r.price_change_1h:+.1f}% 1h)",
         ]
         if sell_note:
-            lines.append(sell_note)
+            lines.append(f"⚠️ {sell_note} of ${r.token.symbol}")
+        lines.extend([
+            f"",
+            f"📊 https://dexscreener.com/solana/{r.token.mint}",
+            f"DYOR — Monkes manage risk 🐒",
+        ])
         return "\n".join(lines)
 
     # ── Console ────────────────────────────────────────────────────────────────
@@ -906,38 +966,6 @@ class AlertSender:
         for line in body.splitlines():
             print(f"  {line}")
         print(f"{sep}\n")
-
-    # ── FCM ────────────────────────────────────────────────────────────────────
-
-    def fcm(self, r: TAResult) -> None:
-        if not self._fcm_ready:
-            return
-        title, body = self._title_body(r)
-        data_payload = {
-            "mint":   r.token.mint,
-            "symbol": r.token.symbol,
-            "price":  str(r.price),
-            "score":  str(r.score),
-        }
-        notification = messaging.Notification(title=title, body=body)
-
-        if CFG.fcm_device_token:
-            msg = messaging.Message(
-                notification=notification,
-                data=data_payload,
-                token=CFG.fcm_device_token,
-            )
-        else:
-            msg = messaging.Message(
-                notification=notification,
-                data=data_payload,
-                topic=CFG.fcm_topic,
-            )
-        try:
-            resp = messaging.send(msg)
-            log.info("FCM sent: %s", resp)
-        except Exception as exc:
-            log.error("FCM send failed for %s: %s", r.token.symbol, exc)
 
     # ── Telegram (raw HTTP — no extra packages) ────────────────────────────────
 
@@ -1007,10 +1035,11 @@ class AlertSender:
         price  = sale.get("price",  0.0)
         buyer_short  = f"{buyer[:4]}…{buyer[-4:]}"  if len(buyer)  > 8 else buyer
         seller_short = f"{seller[:4]}…{seller[-4:]}" if len(seller) > 8 else seller
+        risk_icon = "🟢" if price >= 2 else ("🟡" if price >= 1 else "🔴")
         message = "\n".join([
-            f"🐒 {name} just sold for {price:.4f} SOL",
-            f"Buyer:  {buyer_short}",
-            f"Seller: {seller_short}",
+            f"{risk_icon} 🐒 {name} — {price:.2f} SOL",
+            f"{seller_short} → {buyer_short}",
+            f"https://magiceden.io/item-details/sagamonkes",
         ])
         if not self._post_to_agent(message, "nft_sale"):
             log.warning("XMTP NFT sale alert could not be delivered for %s", name)
@@ -1022,7 +1051,6 @@ class AlertSender:
     def send_all(self, r: TAResult) -> None:
         """Dispatch a bullish alert via all channels."""
         self.console(r)
-        self.fcm(r)
         self.telegram(r)
 
     def send_all_bearish(self, r: TAResult) -> None:
@@ -1156,6 +1184,8 @@ class SolanaAlertBot:
     dispatches alerts when bullish confluence is detected.
     """
 
+    _TRENDING_REFRESH_SECS = 1800  # refresh trending list every 30 minutes
+
     def __init__(self):
         self._store       = TokenStore()
         self._dex         = DexScreener()
@@ -1167,6 +1197,9 @@ class SolanaAlertBot:
         self._last_bearish_alert: Dict[str, float] = {}
         # Latest TA results for bot_state.json (keyed by mint)
         self._latest_results: Dict[str, TAResult] = {}
+        # Trending tokens — in-memory only, refreshed every 30 min, not saved to tokens.json
+        self._trending_tokens: List[TokenInfo] = []
+        self._trending_refreshed_at: float = 0.0
 
     # ── Pool discovery ─────────────────────────────────────────────────────────
 
@@ -1300,11 +1333,46 @@ class SolanaAlertBot:
             self._alerts.send_all_bearish(result)
             self._last_bearish_alert[token.mint] = time.time()
 
+    # ── Trending token refresh ─────────────────────────────────────────────────
+
+    def _refresh_trending(self) -> None:
+        """
+        Fetch trending Solana tokens from DexScreener and populate
+        self._trending_tokens (in-memory only, never written to tokens.json).
+        Tokens already in the pinned watch list are skipped.
+        """
+        try:
+            mints = self._dex.trending_solana(top_n=30)
+        except Exception as exc:
+            log.warning("Failed to fetch trending tokens: %s", exc)
+            return
+
+        pinned_mints  = {t.mint for t in self._tokens}
+        current_mints = set(mints)
+
+        # Remove tokens that have dropped off the trending list
+        self._trending_tokens = [
+            t for t in self._trending_tokens if t.mint in current_mints
+        ]
+
+        existing_mints = {t.mint for t in self._trending_tokens}
+        new_count = 0
+        for mint in mints:
+            if mint not in pinned_mints and mint not in existing_mints:
+                self._trending_tokens.append(TokenInfo(mint=mint))
+                new_count += 1
+
+        self._trending_refreshed_at = time.time()
+        log.info(
+            "Trending refresh: %d trending token(s) tracked (%d new)",
+            len(self._trending_tokens), new_count,
+        )
+
     # ── Main async loop ────────────────────────────────────────────────────────
 
     async def _loop(self) -> None:
         log.info(
-            "Bot running — %d token(s) watched — poll interval: %ds — min score: %d/7",
+            "Bot running — %d pinned token(s) — poll interval: %ds — min score: %d/7",
             len(self._tokens), CFG.poll_interval, CFG.min_score,
         )
 
@@ -1312,7 +1380,17 @@ class SolanaAlertBot:
             cycle_start = time.monotonic()
             log.info("── Cycle start ──────────────────────────────")
 
-            for token in self._tokens:
+            # Refresh trending tokens every 30 minutes
+            if time.time() - self._trending_refreshed_at >= self._TRENDING_REFRESH_SECS:
+                await asyncio.to_thread(self._refresh_trending)
+
+            all_tokens = self._tokens + self._trending_tokens
+            log.info(
+                "Checking %d token(s) (%d pinned + %d trending)",
+                len(all_tokens), len(self._tokens), len(self._trending_tokens),
+            )
+
+            for token in all_tokens:
                 try:
                     # Run blocking I/O in a thread pool; keeps the event loop alive
                     await asyncio.to_thread(self._check, token)

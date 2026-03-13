@@ -19,8 +19,8 @@ Two-process architecture:
 
 ## Features
 
-- **Bearish/Bullish scoring** — EMA death cross, MACD crossovers, RSI thresholds, volume analysis
-- **Saga Monke NFT sale alerts** — monitors Magic Eden for new sales
+- **Bearish/Bullish scoring** — EMA death cross, MACD crossovers, RSI thresholds, volume analysis; color-coded risk dots (🟢/🟡/🔴), confluence tags, inline DEXScreener/Jupiter links
+- **Saga Monke NFT sale alerts** — monitors Magic Eden for new sales; compact format with risk dot + Magic Eden link
 - **AI DM responses** — Claude AI answers questions in private DMs
 - **FCM push notifications** — direct Firebase Cloud Messaging (no Expo relay); sends heads-up alerts to all registered device tokens
 - **Slash commands** in group chat and DMs:
